@@ -1,0 +1,7 @@
+# Python 3.11; TensorFlow 2.16 is the final macOS Intel release series.
+numpy==1.26.4
+pandas==2.2.3
+scikit-learn==1.5.2
+joblib==1.4.2
+tensorflow==2.16.2
+keras==3.6.0

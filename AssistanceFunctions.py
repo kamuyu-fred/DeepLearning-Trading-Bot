@@ -2,12 +2,9 @@ from sklearn.preprocessing import MinMaxScaler
 import numpy as np
 from joblib import Parallel, delayed
 import pandas as pd
-import pandas_ta as ta
 import multiprocessing
 import os
 from sklearn.metrics import classification_report
-from tensorflow.keras.utils import to_categorical
-import tensorflow as tf
 from datetime import time
 
 class DeepLearning:
@@ -30,6 +27,7 @@ class DeepLearning:
     @staticmethod
     def indicator_calc(price_action, data_requirements, indicator_type, periods):
         types = None
+        import pandas_ta as ta  # Optional dependency for legacy indicator utilities.
         indicator_func= getattr(ta, indicator_type)
         indicators = pd.DataFrame()
 
@@ -59,6 +57,7 @@ class DeepLearning:
     @staticmethod
     def indicator_calc_others(price_action,type,data_requirements,parameter_dict_list):
         'Parameters should be an array of dict values that are nested'
+        import pandas_ta as ta  # Optional dependency for legacy indicator utilities.
         indicator_func, indicators = getattr(ta, type), pd.DataFrame()
         if data_requirements == "c":
             for arguments in parameter_dict_list:
@@ -274,6 +273,7 @@ class DeepLearning:
 
     @staticmethod
     def label_encode(data):
+        from tensorflow.keras.utils import to_categorical
         encoder = to_categorical(data, num_classes=3)
         return encoder
 
@@ -282,6 +282,7 @@ class DeepLearning:
     @staticmethod
     def custom_loss_function(y_pred, y_true):
         '''This custom loss maximizes the Precision of ( buy and sell ) while factoring in the recall '''
+        import tensorflow as tf
         alpha, beta = 0.7, 0.3 #Weights to be used
 
 
@@ -614,54 +615,15 @@ class DeepLearning:
 
 
     @staticmethod
-    def feature_creator(prices):
-
-        def heiken_ashi(price):
-            actual_price = price.copy()
-            actual_price.reset_index(inplace=True)
-            heikin_ashi = pd.DataFrame()
-
-            heikin_ashi['datetime'] = actual_price['datetime']
-
-            # Calculate Heikin-Ashi close (vectorized)
-            heikin_ashi['H_close'] = (actual_price['high'] + actual_price['low'] + actual_price['close'] + actual_price['open']) / 4
-
-            # Initialize the first Heikin-Ashi open price as the average of the first actual open and close
-            heikin_ashi['H_open'] = 0.0  # Temporary column for initialization
-            heikin_ashi.iloc[0, heikin_ashi.columns.get_loc('H_open')] = (actual_price['open'].iloc[0] +actual_price['close'].iloc[0]) / 2  # first value
-
-            # Calculate open prices using a loop
-            for index in range(1, len(actual_price)):
-                heikin_ashi.iloc[index, heikin_ashi.columns.get_loc('H_open')] = (heikin_ashi['H_open'].iloc[index - 1] +heikin_ashi['H_close'].iloc[index - 1]) / 2
-
-            # Calculate Heikin-Ashi high and low (vectorized)
-            heikin_ashi['H_high'] = actual_price[['high', 'open', 'close']].max(axis=1)
-            heikin_ashi['H_low'] = actual_price[['low', 'open', 'close']].min(axis=1)
-
-            heikin_ashi.loc[heikin_ashi['H_high'] < heikin_ashi['H_open'], 'H_high'] = heikin_ashi['H_open']
-
-            # Adjust HA_Low for bullish candles where HA_Low > HA_Open
-            heikin_ashi.loc[heikin_ashi['H_low'] > heikin_ashi['H_open'], 'H_low'] = heikin_ashi['H_open']
-
-            # creation of classes ( strong bull )
-            heikin_ashi['strong_bull'] = (heikin_ashi['H_low'] == heikin_ashi['H_open']).astype(int)
-            heikin_ashi['strong_bear'] = (heikin_ashi['H_high'] == heikin_ashi['H_open']).astype(int)
-            heikin_ashi['neutral'] = ((heikin_ashi['H_low'] != heikin_ashi['H_open']) & (heikin_ashi['H_high'] != heikin_ashi['H_open'])).astype(int)
-            heikin_ashi.drop('datetime', axis=1, inplace = True)
-
-            return heikin_ashi
-
-
-        x1 =  prices[['atr_7','atr_14', 'ema_12', 'ema_21','ema_50']].to_numpy().astype(np.float32)
-        x1 = x1.reshape(1, 21, 4)
-
-
-        heikin = heiken_ashi(prices.reset_index()) #for datetime to be shown ( have not modified it in any way )
-        x2 = (np.concatenate(heikin.to_numpy())).astype(np.float32)
-        x2 = x2.reshape((1, 21, 7))
-
-
-        return x1, x2
+    def feature_creator(prices, scaler=None, config=None):
+        """Use the persisted scaler and schema instead of the legacy feature layout."""
+        from pipeline import inference_inputs
+        if scaler is None or config is None:
+            raise ValueError('Load a versioned model bundle and provide its scaler and config')
+        if 'datetime' not in prices.columns:
+            prices = prices.reset_index()
+        inputs = inference_inputs(prices, scaler, config)
+        return inputs['TA'], inputs['OHLC']
 
     @staticmethod
     def price_gen_V2(sl, tp, prices, look_forward, sequence_length, ta_columns):
@@ -899,50 +861,9 @@ class DeepLearning:
 
     @staticmethod
     def label_creator(sl,tp, price,look_forward, look_back, columns_wanted):
-        outcome, timesteps = [],[]
-        close_index = list(price.columns).index('close')
-        for index, instance in enumerate(price.itertuples()):
-            #manage last
-            hit_type = 2
-            if index + look_forward > len(price) :
-                break
-
-            future_prices = price.iloc[index: index + (look_forward) + 1 ]
-            entry_price = instance.close # Represents the open price of the next candle
-
-            # Trading logic
-            sl_buy, tp_buy = entry_price - sl, entry_price + tp
-            sl_sell, tp_sell = entry_price + sl, entry_price - tp
-
-            #for buys
-            if (future_prices['high'] > tp_buy).any():
-                buy_tp_index = (future_prices['high'] > tp_buy).idxmax()#possible error if index == 0
-                future_prices = future_prices[:buy_tp_index + 1].copy()
-                if (future_prices['low'] > sl_buy).all():
-                    hit_type = 0
-
-            if (future_prices['low'] < tp_sell).any():
-                sell_tp_index = (future_prices['low'] < tp_sell).idxmax()  # possible error if index == 0
-                future_prices = future_prices[:sell_tp_index + 1].copy()
-                if (future_prices['high'] < sl_sell).all():
-                    hit_type = 1
-
-
-            #create the timesteps
-            if index <= look_back:
-                continue
-
-            prev_prices = price[columns_wanted].iloc[(index - look_back): index] # include last value?
-
-            temp_reshape = prev_prices.values.flatten().reshape(len(prev_prices), len(columns_wanted))
-
-            timesteps.append(temp_reshape)
-            outcome.append(hit_type)
-
-
-        # price['result'] = pd.Series(outcome)
-
-        return timesteps, outcome
+        from pipeline import label_windows
+        return label_windows(price=price, sl=sl, tp=tp, look_forward=look_forward,
+                             look_back=look_back, columns_wanted=columns_wanted)
 
     @staticmethod
     def price_gen_V4(price, forward_length, timestep_length, indicator_columns, repeat):
