@@ -1,98 +1,91 @@
-from tensorflow.keras.layers import Input, LSTM, Dense, Concatenate, Dropout
-from tensorflow.keras.models import Model
+"""Train and evaluate the shared two-input model; supports CPU-only machines."""
+import argparse
+import hashlib
+import json
+from pathlib import Path
+
 import numpy as np
-import tensorflow as tf
-from sklearn.utils.class_weight import  compute_class_weight
-from AssistanceFunctions import DeepLearning
-from tensorflow import keras
-from tensorflow.keras.callbacks import EarlyStopping
 
-# Set a maximum memory limit
-gpus = tf.config.list_physical_devices('GPU')
-tf.config.set_logical_device_configuration(gpus[0],[tf.config.LogicalDeviceConfiguration(memory_limit=8044)] ) # Limit to 7.9 gigs approx.
-
-#Data Loading
-tp_sl = 'tp_4_sl_9' #Initialize the take profit and stop loss levels used for the feature creation
-
-x1_t = np.load(f'C:/Users/muyu2/OneDrive/Documents/DeepLearning/{tp_sl}/test/techs.npy', allow_pickle=True)
-x2_t  = np.load(f'C:/Users/muyu2/OneDrive/Documents/DeepLearning/{tp_sl}/test/ohlc.npy', allow_pickle=True)
-y_t = np.load(f'C:/Users/muyu2/OneDrive/Documents/DeepLearning/{tp_sl}/test/label.npy', allow_pickle=True)
+from pipeline import load_dataset, load_metadata
 
 
-# Input 1(Technical indicators)
-input_1 = Input(shape=(21, 7), name='TA')
-x1 = LSTM(64, return_sequences=False, name='lstm_TA')(input_1)
-
-#input 2 ( Price action - Open , high, Low , close)
-input_2 = Input(shape=(21,4), name='OHLC')
-x2  = LSTM(128,return_sequences=False, name='lstm_ohlc')(input_2)
-x = Dropout(0.2, name='dropout1')(x2)
-
-#concact
-merged = Concatenate(name='Merger')([x1,x2])
-
-# Fully connected layers
-x = Dense(128, activation='relu', name='dense_1')(merged)
-x = Dense(64, activation='relu', name='dense_2')(x)
-x = Dense(32, activation='relu',name= 'dense_3')(x) # try different activations
-
-# Output layer
-output = Dense(3, activation='softmax', name='output')(x)
-
-model = Model([input_1, input_2], outputs=output)
-early_stopping = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
-
-model.compile(optimizer=keras.optimizers.Adam(learning_rate=0.0003),loss=keras.losses.categorical_crossentropy,
-    metrics=[tf.keras.metrics.Precision(class_id=0, name='precision_buy'),
-        tf.keras.metrics.Recall(class_id=0, name='recall_buy'),
-        tf.keras.metrics.Precision(class_id=1, name='precision_sell'),
-        tf.keras.metrics.Recall(class_id=1, name='recall_sell')
-     ]
-)
-
-model.summary()
-
-x1_train = np.load(f'C:/Users/muyu2/OneDrive/Documents/DeepLearning/{tp_sl}/train/techs.npy', allow_pickle=True)
-x2_train = np.load(f'C:/Users/muyu2/OneDrive/Documents/DeepLearning/{tp_sl}/train/ohlc.npy', allow_pickle=True)
-y_train = np.load(f'C:/Users/muyu2/OneDrive/Documents/DeepLearning/{tp_sl}/train/label.npy', allow_pickle=True)
+def build_model(config):
+    from tensorflow import keras
+    ta = keras.Input(shape=(config.look_back, 4), name='TA')
+    ohlc = keras.Input(shape=(config.look_back, 4), name='OHLC')
+    technical = keras.layers.LSTM(64, name='lstm_TA')(ta)
+    price = keras.layers.LSTM(128, name='lstm_ohlc')(ohlc)
+    price = keras.layers.Dropout(.2, name='dropout')(price)
+    x = keras.layers.Concatenate()([technical, price])
+    for units in [128, 64, 32]:
+        x = keras.layers.Dense(units, activation='relu')(x)
+    output = keras.layers.Dense(3, activation='softmax')(x)
+    model = keras.Model({'TA': ta, 'OHLC': ohlc}, output)
+    model.compile(optimizer=keras.optimizers.Adam(learning_rate=.0003),
+                  loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+    return model
 
 
-#correct shape of X2
-ohlc = np.concatenate(x2_train).flatten()
-x2_train  = ohlc.reshape((len(x2_train), 21, 7))
+def train(directory, epochs=100, batch_size=64, seed=42):
+    import tensorflow as tf
+    from sklearn.utils.class_weight import compute_class_weight
+    from sklearn.metrics import classification_report
+    if epochs < 1 or batch_size < 1:
+        raise ValueError('Epochs and batch size must be positive')
+    tf.keras.utils.set_random_seed(seed)
+    tf.config.experimental.enable_op_determinism()
+    for gpu in tf.config.list_physical_devices('GPU'):
+        tf.config.experimental.set_memory_growth(gpu, True)
+    config, _ = load_metadata(directory)
+    datasets = [load_dataset(directory, name, config) for name in ['train', 'validation', 'test']]
+    training, validation, test = datasets
+    if any(left['timestamps'][-1] >= right['timestamps'][0]
+           for left, right in zip(datasets, datasets[1:])):
+        raise ValueError('Dataset partitions overlap or are out of chronological order')
+    classes = np.unique(training['labels'])
+    weights = compute_class_weight('balanced', classes=classes, y=training['labels'])
+    class_weights = dict(zip(classes.tolist(), weights.tolist()))
+    model = build_model(config)
+    def inputs(data):
+        return {'TA': data['ta'], 'OHLC': data['ohlc']}
+    model.fit(inputs(training), training['labels'], epochs=epochs, batch_size=batch_size,
+              shuffle=False, class_weight=class_weights,
+              validation_data=(inputs(validation), validation['labels']),
+              callbacks=[tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=5,
+                                                         restore_best_weights=True)], verbose=2)
+    metrics = model.evaluate(inputs(test), test['labels'], return_dict=True, verbose=0)
+    predictions = model.predict(inputs(test), verbose=0).argmax(axis=1)
+    print(classification_report(test['labels'], predictions, labels=[0, 1, 2],
+                                target_names=['buy', 'sell', 'hold'], zero_division=0))
+    model.save(Path(directory) / 'model.keras')
+    manifest = {name: hashlib.sha256(Path(directory, name).read_bytes()).hexdigest()
+                for name in ['metadata.json', 'model.keras']}
+    Path(directory, 'model-manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+    return metrics
 
 
-#Modfication of class weights ( to combat the unbalanced classes )
-y_train_int = np.argmax(y_train, axis=1)
-classes = np.unique(y_train_int)
-weights = compute_class_weight(class_weight='balanced', classes=classes, y=y_train_int)
-
-weights_dict = {
-    0:weights[0],
-    1:weights[1],
-    2:weights[2]
-}
-print(weights_dict)
-
-#class weights to be returned later
-model.fit(x1_train,y_train, batch_size=64, epochs=100 ,verbose=2 ,callbacks=[early_stopping],class_weight=weights_dict,validation_split=0.10)
-
-#Data Loading and class weights calc
-x1_t = np.load(f'C:/Users/muyu2/OneDrive/Documents/DeepLearning/{tp_sl}/test/techs.npy', allow_pickle=True)
-x2_t  = np.load(f'C:/Users/muyu2/OneDrive/Documents/DeepLearning/{tp_sl}/test/ohlc.npy', allow_pickle=True)
-y_t = np.load(f'C:/Users/muyu2/OneDrive/Documents/DeepLearning/{tp_sl}/test/label.npy', allow_pickle=True)
+def load_bundle(directory):
+    from tensorflow import keras
+    config, scaler = load_metadata(directory)
+    manifest = json.loads(Path(directory, 'model-manifest.json').read_text())
+    for name in ['metadata.json', 'model.keras']:
+        if manifest.get(name) != hashlib.sha256(Path(directory, name).read_bytes()).hexdigest():
+            raise ValueError('Model bundle files do not match; regenerate and retrain')
+    model = keras.models.load_model(Path(directory) / 'model.keras', compile=False)
+    if ([tuple(shape[1:]) for shape in model.input_shape] != [(config.look_back, 4)] * 2
+            or tuple(model.output_shape[1:]) != (3,)):
+        raise ValueError('Model does not match preprocessing schema; retrain')
+    return model, config, scaler
 
 
-#Model evaluation
-test_len = round(len(x1_t) * 0.6)# Remaining data is to be used for validation purposes
-x1_test,x2_test , y_test = x1_t[:test_len],x2_t[:test_len], y_t[:test_len]
-
-x1_test, x2_test = DeepLearning.format_test(x1_test, x2_test,y=y_test, timesteps=21,features_x1=7, features_x2=4)
-model.evaluate([x1_test, x2_test], y_test , verbose=2)
-
-#saving the model
-model.save("C:/Users/muyu2/OneDrive/Documents/DeepLearning/models/model_name4.h5")
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--artifacts', type=Path, default=Path('artifacts'))
+    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--batch-size', type=int, default=64)
+    args = parser.parse_args()
+    print(train(args.artifacts, args.epochs, args.batch_size))
 
 
-
-
+if __name__ == '__main__':
+    main()
