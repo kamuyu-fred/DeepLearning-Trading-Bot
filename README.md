@@ -1,141 +1,125 @@
-# 🧠📈 Forex Trading Bot with Deep Learning and Automated Execution
+# Forex Trading Bot: reproducible training and dry-run execution
 
-This project is an intelligent Forex trading bot that uses deep learning to make trade decisions and execute orders automatically. It supports two execution modes based on broker compatibility — via the MetaTrader 5 API or UI automation for brokers that restrict automated access.
+An experimental EUR/USD M15 classifier with two LSTM inputs and optional
+MetaTrader 5 API execution. Predictions represent buy, sell, or hold; classification
+accuracy alone does not establish profitable trading.
 
----
+## Setup
 
-## 🚀 Features
-
-- **LSTM-based deep learning model** for time series prediction:
-  - Multiple stacked LSTM layers to capture temporal patterns
-  - Dropout layers to reduce overfitting
-  - Dense output layer with softmax for multi-class prediction (Buy / Sell / Hold)
-- Automatically places and modifies orders based on model predictions.
-- Supports both **MetaTrader 5 API** and **screen automation** (for brokers that block MT5 API).
-- Configurable stop-loss and take-profit settings.
-- Designed for high-frequency, real-time trading using technical indicators.
-- Modular and extensible for additional trading logic or broker support.
-
----
-
-## 🛠️ Technologies Used
-
-### 📊 Machine Learning & Data
-- **TensorFlow / Keras** – LSTM-based deep learning model  
-- **NumPy / Pandas** – Data processing and manipulation  
-- **TA-Lib** – Generating technical indicators  
-- **Scikit-learn** – Data scaling and evaluation metrics  
-
-### 🖥️ Automation & Execution
-- **MetaTrader5** – API to place and manage trades  
-- **PyAutoGUI** – Screen control (clicks, typing, screenshots)  
-- **Pywinauto** – Automating Windows UI interactions  
-- **Pytesseract** – OCR to extract price data from screenshots  
-
----
-
-## 🔁 Workflow Overview
-
-1. **Data Preparation**  
-   - `FeatureCreation.py` handles feature engineering with technical indicators.
-   - Data file `eurusd-15m.csv` contains historical price data used for model training.
-
-2. **Model Training**  
-   - `model.py` builds and trains the LSTM model.
-   - Outputs a trained file like `trained_model.h5`.
-
-3. **Broker Type Selection**
-   - ✅ If your broker supports MetaTrader 5: use `MetaTrader.py`
-   - ❌ If not, use screen automation via `OrderAutomation.py`
-
-4. **Trade Execution**
-   - `AssistanceFunctions.py` contains helper logic for modifying orders and setting SL/TP.
-   - Choose execution mode and run real-time predictions and trades.
-
----
-
-## ⚙️ Installation
-
-1. Clone this repository:
-   ```bash
-   git clone https://github.com/Kamuyu-N/DL-Trading-Bot.git
-   cd DL-Trading-Bot
-   ```
-
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-3. Install [Tesseract-OCR](https://github.com/tesseract-ocr/tesseract) and add the path to system environment variables.
-
----
-
-## 🧠 Training the LSTM Model
-
-Make sure `eurusd-15m.csv` is present.
+Use **Python 3.11** in a virtual environment:
 
 ```bash
-python model.py
+python3.11 -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
+python -m pip install -r requirements-dev.txt
+python -m pip check
 ```
 
-The model includes:
-- `LSTM` layers for sequence learning  
-- `Dropout` layers to prevent overfitting  
-- `Dense` output for class prediction (Buy, Sell, Hold)  
-- Compiled with `categorical_crossentropy` and `Adam` optimizer
+`requirements.txt` contains the core runtime. The development manifest also installs
+pytest. Windows users running the MT5 adapter should additionally install
+`requirements-windows.txt` and have the MetaTrader 5 terminal installed and logged in.
+GUI/OCR automation is disabled and requires no GUI dependencies.
 
----
+TensorFlow is pinned to 2.16.2 to support this repository's Intel Mac CPU workflow;
+[TensorFlow documents 2.16 as the last macOS x86 release series](https://www.tensorflow.org/install/pip).
+CPU training is supported. Compatible TensorFlow GPU environments can use detected
+GPUs with memory growth enabled. Native Windows GPU setup is not provided here.
 
-## ▶️ Running the Bot
-
-### ✅ MetaTrader 5 API Method
-
-Use this if your broker allows direct MT5 access:
+## Prepare and train
 
 ```bash
-python MetaTrader.py
+python FeatureCreation.py --csv eurusd-15m.csv --output artifacts
+python model.py --artifacts artifacts --epochs 100 --batch-size 64
 ```
 
-### ❌ Screen Automation Method
+The bundled CSV has **no header** and contains semicolon-separated
+`date;time;open;high;low;close;volume` columns, with day-first dates. Preparation
+validates positive finite prices, candle bounds, and unique timestamps, then sorts
+chronologically. Use a new, empty output directory for each experiment.
 
-Use this for brokers that don’t support automation:
+The versioned schema is:
+
+- 30 completed M15 candles per sample, ending at the entry candle's close.
+- Technical input: EMA100-minus-close, EMA200-minus-close, EMA50-minus-close, ATR14.
+- Price input: open, high, low, and close log returns, in that order.
+- Model calls use named `TA` and `OHLC` inputs. Both inputs have shape `(samples, 30, 4)`; labels are buy `0`, sell `1`, hold `2`.
+- EMA uses pandas `ewm(adjust=False)`; ATR uses true range with Wilder smoothing
+  (`alpha=1/14`, `adjust=False`). Indicator initialization is part of schema v1.
+- Entry is the last input candle's close. The next 15 candles determine outcomes,
+  with stop distance `0.0010` and target distance `0.0015`. Equality hits a barrier;
+  a stop wins when both barriers occur in one candle. Dual winning directions or
+  neither winning direction produce hold. Spread/slippage are not modeled in labels.
+
+Raw candles are split into 72% training, 8% validation, and 20% test. Each partition
+warms up indicators independently and contains its own complete windows and label
+horizons. Scaling is fitted only on training features. Validation data controls early
+stopping; test data is used for the final classification report.
+
+Preparation writes `train.npz`, `validation.npz`, `test.npz`, and `metadata.json`.
+Training writes `model.keras` and a `model-manifest.json` checksum manifest beside them. Metadata records feature order, indicator
+method, scaler parameters, symbol, timeframe, and labeling settings. Keep the entire
+directory together; loading rejects mixed model/metadata files. **Old `.npy` datasets, `.h5` models, and old scalers are incompatible;
+regenerate and retrain.** Existing artifact directories are never silently reused by
+preparation. Training may replace `model.keras` within the selected directory.
+
+## MT5 dry-run and explicit execution
+
+On Windows with the terminal connected:
 
 ```bash
-python OrderAutomation.py
+python MetaTrader.py --artifacts artifacts
 ```
 
-You can customize trade direction, pip size, and screen region inside the script.
+This requests 2,000 completed candles, excluding the forming candle, applies the
+saved preprocessing, and previews a request only when buy or sell probability reaches
+0.9. EMA is recursive: its initialization can differ slightly when live and historical
+history start at different points; the extended history reduces this effect.
 
----
+Only `--execute` enables submission. Validate with a demo account before enabling it:
 
-## 📸 Screenshot Automation Notes
+```bash
+python MetaTrader.py --artifacts artifacts --execute --volume 0.01 --deviation 20
+```
 
-- `OrderAutomation.py` captures a region of the screen and uses OCR to extract prices.
-- `PyAutoGUI` and `Pywinauto` simulate user input to:
-  - Place a trade
-  - Open trade modification
-  - Set Stop Loss and Take Profit
+Volume is in lots; deviation is in broker points. The adapter checks account access,
+symbol settings, tick freshness, price/volume precision, and protective distances.
+It uses ask for buys, bid for sells, and the bundle's stop/target distances. It blocks
+existing positions or pending orders for the symbol and only supports fill-or-kill
+execution. Broker `order_check` must succeed before submission; submission failures
+are never automatically retried. An uncertain result requires inspecting the terminal.
+This is a single-run script, not a scheduler; do not run concurrent instances.
 
----
+Order checks follow the [MT5 Python API](https://www.mql5.com/en/docs/python_metatrader5/mt5ordercheck_py)
+and [symbol filling-policy documentation](https://www.mql5.com/en/book/automation/symbols/symbols_execution_filling).
+Broker integration is tested with mocks; actual Windows/demo-terminal validation
+remains required. Existing-position checks cannot make concurrent external trading
+atomic, and successful submission does not replace ongoing position monitoring.
 
-## ⚠️ Disclaimer
+`python OrderAutomation.py` exits before accessing the terminal. OCR and fixed
+coordinates cannot reliably identify positions or confirm protective levels.
 
-> This project is intended for educational and experimental purposes only.  
-> Trading financial markets involves risk. Use at your own discretion and risk.
+## Tests and repository layout
 
----
+```bash
+python -m pytest -q
+```
 
-## 🤝 Contributions
+Tests cover label barriers, timestamp/index handling, dataset/scaler alignment,
+shared preprocessing, a short CPU training/reload/prediction cycle, and mocked MT5
+success/failure paths. Tests never submit broker orders.
 
-Want to contribute? PRs and ideas are welcome!
+`pipeline.py` owns preprocessing and artifact validation. `FeatureCreation.py`,
+`model.py`, and `MetaTrader.py` provide guarded CLI entry points.
+`AssistanceFunctions.py` and `main.py` retain matching legacy utility definitions;
+`main.py` is not a bot launcher. Their label helper delegates to the shared pipeline.
+Legacy indicator utilities still require optional `pandas_ta`, which the supported
+pipeline does not use. The old standalone custom-loss and experimental generators
+are not part of the supported workflow.
 
-1. Fork the repo  
-2. Create a feature branch  
-3. Submit a pull request  
+## Contributing
 
----
-
-## 📬 Contact
-
-Feel free to reach out for collaboration or questions!
+Create a feature branch on your fork and submit a PR to
+[Kamuyu-N/DeepLearning-Trading-Bot](https://github.com/Kamuyu-N/DeepLearning-Trading-Bot).
+Use focused, imperative commits. Describe the affected pipeline stages, behavior
+changes, artifact compatibility, and validation results. Keep credentials, local
+agent instructions, environments, generated artifacts, and bytecode out of commits.
